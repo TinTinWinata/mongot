@@ -9,6 +9,7 @@ import com.xgen.mongot.util.bson.parser.Field;
 import com.xgen.mongot.util.bson.parser.FieldValidator;
 import com.xgen.mongot.util.bson.parser.Value;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.stream.IntStream;
 import org.apache.commons.lang3.Range;
@@ -59,8 +60,40 @@ public sealed interface FacetDefinition extends DocumentEncodable
 
   Type getType();
 
-  record StringFacetDefinition(String path, int numBuckets) implements FacetDefinition {
+  /**
+   * A facet over a string field, optionally accompanied by metrics accumulated per bucket.
+   *
+   * @param metrics Accumulators evaluated per bucket, keyed by the name they are returned under.
+   *     Empty when the query asks only for bucket counts.
+   */
+  record StringFacetDefinition(
+      String path, int numBuckets, Map<String, MetricDefinition> metrics)
+      implements FacetDefinition {
+
+    /** Creates a definition with no metrics, i.e. bucket counts only. */
+    public StringFacetDefinition(String path, int numBuckets) {
+      this(path, numBuckets, Map.of());
+    }
+
+    private StringFacetDefinition(DocumentParser parser, boolean allow10k)
+        throws BsonParseException {
+      this(
+          parser.getField(FacetDefinition.Fields.PATH).unwrap(),
+          parser
+              .getField(allow10k ? Fields.NUM_BUCKETS_10K : Fields.NUM_BUCKETS_1K)
+              .unwrap(),
+          validateMetricNames(parser.getField(Fields.METRICS).unwrap().orElseGet(Map::of)));
+    }
+
     private static class Fields {
+      private static final Field.Optional<Map<String, MetricDefinition>> METRICS =
+          Field.builder("metrics")
+              .classField(MetricDefinition::fromBson)
+              .disallowUnknownFields()
+              .asMap()
+              .optional()
+              .noDefault();
+
       private static final Field.WithDefault<Integer> NUM_BUCKETS_1K =
           Field.builder("numBuckets")
               .intField()
@@ -80,13 +113,24 @@ public sealed interface FacetDefinition extends DocumentEncodable
       return Type.STRING;
     }
 
-    private StringFacetDefinition(DocumentParser parser, boolean allow10k)
-        throws BsonParseException {
-      this(
-          parser.getField(FacetDefinition.Fields.PATH).unwrap(),
-          parser
-              .getField(allow10k ? Fields.NUM_BUCKETS_10K : Fields.NUM_BUCKETS_1K)
-              .unwrap());
+    /**
+     * Metric names are echoed back as field names, and the sharded merge pipeline reads the
+     * accumulator state behind them by path, so names that are not usable as MQL field names are
+     * rejected up front rather than producing a confusing merge failure.
+     */
+    private static Map<String, MetricDefinition> validateMetricNames(
+        Map<String, MetricDefinition> metrics) throws BsonParseException {
+      for (String name : metrics.keySet()) {
+        if (name.isEmpty() || name.contains(".") || name.startsWith("$")) {
+          throw new BsonParseException(
+              String.format(
+                  "metric name \"%s\" is invalid: names must be non-empty and must not contain"
+                      + " '.' or begin with '$'",
+                  name),
+              Optional.empty());
+        }
+      }
+      return metrics;
     }
 
     @Override
@@ -95,6 +139,9 @@ public sealed interface FacetDefinition extends DocumentEncodable
           .field(FacetDefinition.Fields.TYPE, this.getType())
           .field(FacetDefinition.Fields.PATH, this.path())
           .field(Fields.NUM_BUCKETS_10K, this.numBuckets())
+          .field(
+              Fields.METRICS,
+              this.metrics().isEmpty() ? Optional.empty() : Optional.of(this.metrics()))
           .build();
     }
   }

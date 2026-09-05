@@ -3,11 +3,13 @@ package com.xgen.mongot.index.lucene;
 import static com.xgen.mongot.util.Check.checkState;
 
 import com.xgen.mongot.index.IntermediateFacetBucket;
+import com.xgen.mongot.index.MetricAccumulator;
 import com.xgen.mongot.index.lucene.explain.explainers.FacetFeatureExplainer;
 import com.xgen.mongot.index.query.collectors.FacetDefinition;
 import com.xgen.mongot.util.Check;
 import java.io.IOException;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Stream;
 import org.apache.lucene.facet.FacetResult;
@@ -35,8 +37,23 @@ class LuceneStringFacetMetaBucketProducer implements LuceneMetaBucketProducer {
     this.position = 0;
   }
 
+  /**
+   * Creates a producer for buckets that carry counts only. Used by the drill sideways path, where
+   * metrics are rejected at query validation because each facet is collected over a different set
+   * of matching documents.
+   */
   public static LuceneStringFacetMetaBucketProducer create(
       FacetResult facetCounts, String facetName) throws IOException {
+    return create(
+        facetCounts, facetName, new FacetDefinition.StringFacetDefinition(facetName, 1), Map.of());
+  }
+
+  public static LuceneStringFacetMetaBucketProducer create(
+      FacetResult facetCounts,
+      String facetName,
+      FacetDefinition.StringFacetDefinition definition,
+      Map<String, Map<String, MetricAccumulator>> metricsByLabel)
+      throws IOException {
     List<IntermediateFacetBucket> buckets =
         Stream.of(facetCounts.labelValues)
             // If the value is 0, that means that docs with this ordinal
@@ -48,7 +65,9 @@ class LuceneStringFacetMetaBucketProducer implements LuceneMetaBucketProducer {
                         IntermediateFacetBucket.Type.FACET,
                         facetName,
                         new BsonString(child.label),
-                        child.value.longValue()))
+                        child.value.longValue(),
+                        LuceneFacetMetrics.accumulatorsFor(
+                            definition, metricsByLabel, child.label)))
             .toList();
 
     Optional<FacetFeatureExplainer> explainer = LuceneFacetResultUtil.getFacetFeatureExplainer();

@@ -182,6 +182,100 @@ public class ShardedSearchPlannerTest {
                 new BsonDocument("$sort", new BsonDocument("sortField", new BsonInt32(1))))));
   }
 
+  private static BsonDocument getStringFacetWithMetrics() {
+    return new BsonDocument(
+        "vehicleTypeFacet",
+        new BsonDocument()
+            .append("type", new BsonString("string"))
+            .append("path", new BsonString("vehicleType"))
+            .append(
+                "metrics",
+                new BsonDocument()
+                    .append(
+                        "avgSpeed", new BsonDocument("avg", new BsonString("vehicleSpeed")))));
+  }
+
+  /**
+   * The merge pipeline has to carry the sum and the count across shards and divide once at the end.
+   * Merging per-shard averages is only correct when every shard contributed the same number of
+   * documents, so the accumulator state, not the resolved average, is what crosses the boundary.
+   */
+  @Test
+  public void metaPipeline_facetWithMetrics_mergesAccumulatorStateAndDividesOnce()
+      throws Exception {
+    PlanShardedSearchCommandResponseDefinition.ShardedSearchPlan plan =
+        ShardedSearchPlanner.planSearch(
+            SearchQuery.fromBson(createFacetQuery(getStringFacetWithMetrics())),
+            new PlanShardedSearchCommandDefinition.SearchFeatures(0));
+
+    BsonDocument groupStage = plan.metaPipeline.get(0).getDocument("$group");
+    Assert.assertEquals(
+        new BsonDocument("$sum", new BsonString("$metrics.avgSpeed.count")),
+        groupStage.getDocument("m0_count"));
+    Assert.assertEquals(
+        new BsonDocument("$sum", new BsonString("$metrics.avgSpeed.sum")),
+        groupStage.getDocument("m0_sum"));
+    Assert.assertEquals(
+        new BsonDocument("$min", new BsonString("$metrics.avgSpeed.min")),
+        groupStage.getDocument("m0_min"));
+    Assert.assertEquals(
+        new BsonDocument("$max", new BsonString("$metrics.avgSpeed.max")),
+        groupStage.getDocument("m0_max"));
+
+    BsonDocument bucketProjection =
+        plan.metaPipeline
+            .get(2)
+            .getDocument("$replaceWith")
+            .getDocument("facet")
+            .getDocument("vehicleTypeFacet")
+            .getDocument("buckets")
+            .getDocument("$map")
+            .getDocument("in");
+
+    BsonArray cond =
+        bucketProjection
+            .getDocument("metrics")
+            .getDocument("avgSpeed")
+            .getArray("$cond");
+
+    // Guard on the merged count, divide the merged sum by it, and drop the metric entirely for
+    // buckets to which no shard contributed a value.
+    Assert.assertEquals(
+        new BsonDocument(
+            "$gt", new BsonArray(List.of(new BsonString("$$bucket.m0_count"), new BsonInt32(0)))),
+        cond.get(0));
+    Assert.assertEquals(
+        new BsonDocument(
+            "$divide",
+            new BsonArray(
+                List.of(new BsonString("$$bucket.m0_sum"), new BsonString("$$bucket.m0_count")))),
+        cond.get(1));
+    Assert.assertEquals(new BsonString("$$REMOVE"), cond.get(2));
+  }
+
+  @Test
+  public void metaPipeline_facetWithoutMetrics_isUnchanged() throws Exception {
+    PlanShardedSearchCommandResponseDefinition.ShardedSearchPlan plan =
+        ShardedSearchPlanner.planSearch(
+            SearchQuery.fromBson(createFacetQuery(getSimpleStringFacet())),
+            new PlanShardedSearchCommandDefinition.SearchFeatures(0));
+
+    Assert.assertEquals(
+        new BsonDocument("$sum", new BsonString("$count")),
+        plan.metaPipeline.get(0).getDocument("$group").getDocument("value"));
+    Assert.assertEquals(2, plan.metaPipeline.get(0).getDocument("$group").size());
+    Assert.assertFalse(
+        plan.metaPipeline
+            .get(2)
+            .getDocument("$replaceWith")
+            .getDocument("facet")
+            .getDocument("directorFacet")
+            .getDocument("buckets")
+            .getDocument("$map")
+            .getDocument("in")
+            .containsKey("metrics"));
+  }
+
   @Test
   public void testSortSpec() throws Exception {
     PlanShardedSearchCommandResponseDefinition.ShardedSearchPlan result =

@@ -8,6 +8,7 @@ import com.xgen.mongot.index.query.OperatorQuery;
 import com.xgen.mongot.index.query.SearchQuery;
 import com.xgen.mongot.index.query.collectors.FacetCollector;
 import com.xgen.mongot.index.query.collectors.FacetDefinition;
+import com.xgen.mongot.index.query.collectors.MetricDefinition;
 import com.xgen.mongot.index.query.counts.Count;
 import com.xgen.mongot.index.query.sort.MongotSortField;
 import com.xgen.mongot.index.query.sort.Sort;
@@ -27,6 +28,7 @@ import org.bson.BsonDocument;
 import org.bson.BsonElement;
 import org.bson.BsonInt32;
 import org.bson.BsonString;
+import org.bson.BsonValue;
 
 public class ShardedSearchPlanner {
 
@@ -114,22 +116,68 @@ public class ShardedSearchPlanner {
 
   private static List<BsonDocument> buildMetaPipeline(
       String countType, Optional<Map<String, FacetDefinition>> facetDefinitions) {
+    List<String> metricNames = metricNames(facetDefinitions);
     return List.of(
-        getGroupStage(),
+        getGroupStage(metricNames),
         getFacetStage(facetDefinitions),
-        getReplaceWithStage(countType, facetDefinitions));
+        getReplaceWithStage(countType, facetDefinitions, metricNames));
   }
 
-  /** The $group stage aggregates counts for each (type, path, bucket) combination. */
-  private static BsonDocument getGroupStage() {
+  /**
+   * The distinct metric names requested across all string facets, in a stable order. The index of a
+   * name in this list is what the merge pipeline refers to it by, so that user supplied metric
+   * names never appear as generated field names.
+   */
+  private static List<String> metricNames(
+      Optional<Map<String, FacetDefinition>> facetDefinitions) {
+    return facetDefinitions.orElseGet(Map::of).values().stream()
+        .filter(FacetDefinition.StringFacetDefinition.class::isInstance)
+        .map(FacetDefinition.StringFacetDefinition.class::cast)
+        .flatMap(definition -> definition.metrics().keySet().stream())
+        .distinct()
+        .sorted()
+        .collect(Collectors.toList());
+  }
+
+  private static String metricAccumulatorField(int metricIndex, String suffix) {
+    return String.format("m%d_%s", metricIndex, suffix);
+  }
+
+  /**
+   * The $group stage aggregates counts for each (type, path, bucket) combination, along with the
+   * accumulator state behind each requested metric.
+   *
+   * <p>Sums and counts are merged separately rather than merging per-shard averages, because an
+   * average is not associative: the division happens once, in the $replaceWith stage, after every
+   * shard has contributed.
+   */
+  private static BsonDocument getGroupStage(List<String> metricNames) {
     BsonDocument idDoc =
         new BsonDocument()
             .append("type", new BsonString("$type"))
             .append("tag", new BsonString("$tag"))
             .append("bucket", new BsonString("$bucket"));
     BsonDocument valueDoc = new BsonDocument("$sum", new BsonString("$count"));
-    return new BsonDocument(
-        "$group", new BsonDocument().append("_id", idDoc).append("value", valueDoc));
+    BsonDocument groupDoc =
+        new BsonDocument().append("_id", idDoc).append("value", valueDoc);
+
+    for (int i = 0; i < metricNames.size(); i++) {
+      String source = "$metrics." + metricNames.get(i);
+      groupDoc.append(
+          metricAccumulatorField(i, "count"),
+          new BsonDocument("$sum", new BsonString(source + ".count")));
+      groupDoc.append(
+          metricAccumulatorField(i, "sum"),
+          new BsonDocument("$sum", new BsonString(source + ".sum")));
+      groupDoc.append(
+          metricAccumulatorField(i, "min"),
+          new BsonDocument("$min", new BsonString(source + ".min")));
+      groupDoc.append(
+          metricAccumulatorField(i, "max"),
+          new BsonDocument("$max", new BsonString(source + ".max")));
+    }
+
+    return new BsonDocument("$group", groupDoc);
   }
 
   /** The $facet stage matches the grouped buckets and computes the merged counts and facets. */
@@ -153,11 +201,15 @@ public class ShardedSearchPlanner {
 
   /** The $replaceWith stage formats the output document. */
   private static BsonDocument getReplaceWithStage(
-      String countType, Optional<Map<String, FacetDefinition>> facetDefinitions) {
+      String countType,
+      Optional<Map<String, FacetDefinition>> facetDefinitions,
+      List<String> metricNames) {
     BsonDocument countDoc =
         new BsonDocument(countType, new BsonDocument("$first", new BsonString("$count.value")));
     List<BsonElement> buckets =
-        facetDefinitions.map(ShardedSearchPlanner::getBuckets).orElseGet(Collections::emptyList);
+        facetDefinitions
+            .map(definitions -> getBuckets(definitions, metricNames))
+            .orElseGet(Collections::emptyList);
     BsonDocument replaceWithDoc =
         buckets.isEmpty()
             ? new BsonDocument().append("count", countDoc)
@@ -168,28 +220,84 @@ public class ShardedSearchPlanner {
     return new BsonDocument("$replaceWith", replaceWithDoc);
   }
 
-  private static List<BsonElement> getBuckets(Map<String, FacetDefinition> facetDefinitions) {
+  private static List<BsonElement> getBuckets(
+      Map<String, FacetDefinition> facetDefinitions, List<String> metricNames) {
 
-    // Map the grouped buckets from the $group stage into buckets that only contain the _id and
-    // count.
-    return facetDefinitions.keySet().stream()
+    // Map the grouped buckets from the $group stage into buckets that contain the _id, the count,
+    // and the resolved value of each metric requested on that facet.
+    return facetDefinitions.entrySet().stream()
         .map(
-            name ->
-                new BsonElement(
-                    name,
-                    new BsonDocument(
-                        "buckets",
-                        new BsonDocument(
-                            "$map",
-                            new BsonDocument()
-                                .append("input", new BsonString("$" + name))
-                                .append("as", new BsonString("bucket"))
-                                .append(
-                                    "in",
-                                    new BsonDocument()
-                                        .append("_id", new BsonString("$$bucket._id.bucket"))
-                                        .append("count", new BsonString("$$bucket.value")))))))
+            entry -> {
+              String name = entry.getKey();
+              BsonDocument bucketDoc =
+                  new BsonDocument()
+                      .append("_id", new BsonString("$$bucket._id.bucket"))
+                      .append("count", new BsonString("$$bucket.value"));
+
+              Map<String, MetricDefinition> metrics = metricsOf(entry.getValue());
+              if (!metrics.isEmpty()) {
+                BsonDocument metricsDoc = new BsonDocument();
+                metrics.forEach(
+                    (metricName, metric) ->
+                        metricsDoc.append(
+                            metricName,
+                            resolveMetricExpression(metric, metricNames.indexOf(metricName))));
+                bucketDoc.append("metrics", metricsDoc);
+              }
+
+              return new BsonElement(
+                  name,
+                  new BsonDocument(
+                      "buckets",
+                      new BsonDocument(
+                          "$map",
+                          new BsonDocument()
+                              .append("input", new BsonString("$" + name))
+                              .append("as", new BsonString("bucket"))
+                              .append("in", bucketDoc))));
+            })
         .collect(Collectors.toList());
+  }
+
+  private static Map<String, MetricDefinition> metricsOf(FacetDefinition facetDefinition) {
+    return facetDefinition instanceof FacetDefinition.StringFacetDefinition stringFacetDefinition
+        ? stringFacetDefinition.metrics()
+        : Map.of();
+  }
+
+  /**
+   * Resolves merged accumulator state to the metric's value. Buckets to which no shard contributed
+   * a numeric value drop the metric entirely rather than reporting zero, which matches how mongot
+   * resolves the same state on an unsharded collection.
+   */
+  private static BsonDocument resolveMetricExpression(MetricDefinition metric, int metricIndex) {
+    String count = "$$bucket." + metricAccumulatorField(metricIndex, "count");
+    BsonValue value =
+        switch (metric.type()) {
+          case AVG ->
+              new BsonDocument(
+                  "$divide",
+                  new BsonArray(
+                      List.of(
+                          new BsonString(
+                              "$$bucket." + metricAccumulatorField(metricIndex, "sum")),
+                          new BsonString(count))));
+          case SUM ->
+              new BsonString("$$bucket." + metricAccumulatorField(metricIndex, "sum"));
+          case MIN ->
+              new BsonString("$$bucket." + metricAccumulatorField(metricIndex, "min"));
+          case MAX ->
+              new BsonString("$$bucket." + metricAccumulatorField(metricIndex, "max"));
+        };
+
+    return new BsonDocument(
+        "$cond",
+        new BsonArray(
+            List.of(
+                new BsonDocument(
+                    "$gt", new BsonArray(List.of(new BsonString(count), new BsonInt32(0)))),
+                value,
+                new BsonString("$$REMOVE"))));
   }
 
   /** Get facet results pipeline(s) for the $facet stage. */

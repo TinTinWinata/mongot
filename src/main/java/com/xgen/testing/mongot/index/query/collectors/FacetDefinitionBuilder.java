@@ -1,8 +1,11 @@
 package com.xgen.testing.mongot.index.query.collectors;
 
 import com.xgen.mongot.index.query.collectors.FacetDefinition;
+import com.xgen.mongot.index.query.collectors.MetricDefinition;
 import com.xgen.mongot.util.Check;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import org.bson.BsonDateTime;
 import org.bson.BsonNumber;
@@ -34,16 +37,31 @@ public abstract class FacetDefinitionBuilder {
   public static class StringFacetDefinitionBuilder extends FacetDefinitionBuilder {
 
     private Optional<Integer> numBuckets = Optional.empty();
+    private Map<String, MetricDefinition> metrics = Map.of();
 
     public StringFacetDefinitionBuilder numBuckets(Integer numBuckets) {
       this.numBuckets = Optional.of(numBuckets);
       return this;
     }
 
+    public StringFacetDefinitionBuilder metrics(Map<String, MetricDefinition> metrics) {
+      this.metrics = metrics;
+      return this;
+    }
+
+    public StringFacetDefinitionBuilder metric(
+        String name, MetricDefinition.Type type, String path) {
+      Map<String, MetricDefinition> updated = new HashMap<>(this.metrics);
+      updated.put(name, new MetricDefinition(type, path));
+      this.metrics = updated;
+      return this;
+    }
+
     @Override
     public FacetDefinition.StringFacetDefinition build() {
       Check.isPresent(this.path, "path");
-      return new FacetDefinition.StringFacetDefinition(this.path.get(), this.numBuckets.orElse(10));
+      return new FacetDefinition.StringFacetDefinition(
+          this.path.get(), this.numBuckets.orElse(10), this.metrics);
     }
   }
 

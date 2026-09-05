@@ -21,11 +21,13 @@ import com.xgen.mongot.index.query.InvalidQueryException;
 import com.xgen.mongot.index.query.ReturnScope;
 import com.xgen.mongot.index.query.collectors.FacetCollector;
 import com.xgen.mongot.index.query.collectors.FacetDefinition;
+import com.xgen.mongot.index.query.collectors.MetricDefinition;
 import com.xgen.mongot.util.Check;
 import com.xgen.mongot.util.CheckedStream;
 import com.xgen.mongot.util.FieldPath;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.LongToDoubleFunction;
 import org.apache.lucene.facet.FacetsConfig;
 import org.apache.lucene.facet.range.LongRange;
 import org.bson.BsonNumber;
@@ -53,6 +55,23 @@ class LuceneFacetContext {
       throws InvalidQueryException {
     CheckedStream.from(collector.facetDefinitions().values())
         .forEachChecked(s -> this.validateDefinition(s, returnScope.map(ReturnScope::path)));
+
+    if (collector.drillSidewaysInfo().isPresent() && hasMetrics(collector)) {
+      // Drill sideways runs a separate collector per facet, so the matching documents a metric
+      // would have to read are not the ones the facet counts were produced from. Rejecting is
+      // better than silently returning metrics computed over the wrong document set.
+      throw new InvalidQueryException(
+          "Facet metrics are not supported alongside 'doesNotAffect'. Remove 'doesNotAffect' from"
+              + " the query, or remove 'metrics' from the facet definitions.");
+    }
+  }
+
+  private static boolean hasMetrics(FacetCollector collector) {
+    return collector.facetDefinitions().values().stream()
+        .anyMatch(
+            definition ->
+                definition instanceof FacetDefinition.StringFacetDefinition stringFacetDefinition
+                    && !stringFacetDefinition.metrics().isEmpty());
   }
 
   /**
@@ -108,29 +127,8 @@ class LuceneFacetContext {
       throws InvalidQueryException {
     switch (facetDefinition) {
       case FacetDefinition.NumericFacetDefinition numericFacetDefinition:
-        NumericFieldDefinition numericTypeDef =
-            getNumberFacetFieldDefinition(numericFacetDefinition, returnScope);
-
-        if (numericTypeDef.options().representation()
-            == NumericFieldOptions.Representation.DOUBLE) {
-          return switch (numericTypeDef) {
-            case NumberFacetFieldDefinition numberFacetFieldDefinition ->
-                FieldName.TypeField.NUMBER_DOUBLE_FACET;
-            case NumberFieldDefinition numberFacetFieldDefinition ->
-                FieldName.TypeField.NUMBER_DOUBLE_V2;
-          };
-        } else {
-          return switch (numericTypeDef) {
-            case NumberFacetFieldDefinition numberFacetFieldDefinition -> {
-              if (returnScope.isPresent()) {
-                throwEmbeddedNumberDateV2NotSupported();
-              }
-              yield FieldName.TypeField.NUMBER_INT64_FACET;
-            }
-            case NumberFieldDefinition numberFacetFieldDefinition ->
-                FieldName.TypeField.NUMBER_INT64_V2;
-          };
-        }
+        return numericTypeField(
+            getNumberFacetFieldDefinition(numericFacetDefinition, returnScope), returnScope);
       case FacetDefinition.DateFacetDefinition dateFacetDefinition:
         DatetimeFieldDefinition dateTypeDef =
             dateFacetFieldDefinition(dateFacetDefinition, returnScope);
@@ -138,6 +136,67 @@ class LuceneFacetContext {
           case DateFacetFieldDefinition dateFacetFieldDefinition -> FieldName.TypeField.DATE_FACET;
           case DateFieldDefinition dateFieldDefinition -> FieldName.TypeField.DATE_V2;
         };
+    }
+  }
+
+  /**
+   * Maps a numeric field definition onto the lucene field that carries its doc values. This is the
+   * same field numeric faceting reads, so metrics and facets stay consistent with one another.
+   */
+  private FieldName.TypeField numericTypeField(
+      NumericFieldDefinition numericTypeDef, Optional<FieldPath> returnScope)
+      throws InvalidQueryException {
+    if (numericTypeDef.options().representation() == NumericFieldOptions.Representation.DOUBLE) {
+      return switch (numericTypeDef) {
+        case NumberFacetFieldDefinition numberFacetFieldDefinition ->
+            FieldName.TypeField.NUMBER_DOUBLE_FACET;
+        case NumberFieldDefinition numberFieldDefinition ->
+            FieldName.TypeField.NUMBER_DOUBLE_V2;
+      };
+    }
+
+    return switch (numericTypeDef) {
+      case NumberFacetFieldDefinition numberFacetFieldDefinition -> {
+        if (returnScope.isPresent()) {
+          throwEmbeddedNumberDateV2NotSupported();
+        }
+        yield FieldName.TypeField.NUMBER_INT64_FACET;
+      }
+      case NumberFieldDefinition numberFieldDefinition -> FieldName.TypeField.NUMBER_INT64_V2;
+    };
+  }
+
+  /**
+   * The lucene field a metric reads, together with the decoder that turns the indexed long back
+   * into the number it was derived from. The encoding depends on the representation the field was
+   * indexed with, so it has to be resolved from the index definition rather than assumed.
+   */
+  record NumericMetricField(String luceneFieldName, LongToDoubleFunction decoder) {}
+
+  /** Resolves the doc values field and decoder for a metric over the given numeric path. */
+  NumericMetricField getNumericMetricField(String path, Optional<FieldPath> returnScope)
+      throws InvalidQueryException {
+    FieldPath fieldPath = FieldPath.parse(path);
+    NumericFieldDefinition numericTypeDef = getNumberFieldDefinitionForPath(path, returnScope);
+    FieldName.TypeField typeField = numericTypeField(numericTypeDef, returnScope);
+
+    LongToDoubleFunction decoder =
+        switch (typeField) {
+          case NUMBER_DOUBLE_V2 -> LuceneDoubleConversionUtils::fromMqlSortableLong;
+          case NUMBER_DOUBLE_FACET -> LuceneDoubleConversionUtils::fromLong;
+          default -> value -> (double) value;
+        };
+
+    return new NumericMetricField(
+        typeField.getLuceneFieldName(fieldPath, returnScope), decoder);
+  }
+
+  /** Validates that every metric on a string facet reads a path indexed for numeric faceting. */
+  void validateMetrics(
+      FacetDefinition.StringFacetDefinition facetDefinition, Optional<FieldPath> returnScope)
+      throws InvalidQueryException {
+    for (MetricDefinition metric : facetDefinition.metrics().values()) {
+      getNumberFieldDefinitionForPath(metric.path(), returnScope);
     }
   }
 
@@ -256,6 +315,7 @@ class LuceneFacetContext {
           throwFieldNotIndexed(
               facetDefinition.path(), "token", embeddedPath.map(FieldPath::toString));
         }
+        validateMetrics(stringFacetDefinition, embeddedPath);
         break;
       case FacetDefinition.NumericFacetDefinition numericFacetDefinition:
         if (embeddedPath.isPresent()
@@ -321,23 +381,33 @@ class LuceneFacetContext {
   private NumericFieldDefinition getNumberFacetFieldDefinition(
       FacetDefinition.NumericFacetDefinition facetDefinition, Optional<FieldPath> returnScope)
       throws InvalidQueryException {
+    return getNumberFieldDefinitionForPath(facetDefinition.path(), returnScope);
+  }
+
+  /**
+   * Resolves the numeric field definition to read for a path, following the same {@code
+   * number}/{@code numberFacet} precedence as numeric faceting so that a metric and a facet over
+   * the same path always read the same lucene field.
+   */
+  private NumericFieldDefinition getNumberFieldDefinitionForPath(
+      String path, Optional<FieldPath> returnScope) throws InvalidQueryException {
+    FieldPath fieldPath = FieldPath.parse(path);
 
     Optional<NumberFacetFieldDefinition> numberFacetFieldDef =
         returnScope.isPresent()
             ? Optional.empty()
             : this.fieldDefinitionResolver
-                .getFieldDefinition(FieldPath.parse(facetDefinition.path()), returnScope)
+                .getFieldDefinition(fieldPath, returnScope)
                 .flatMap(FieldDefinition::numberFacetFieldDefinition);
 
     Optional<NumberFieldDefinition> numberFieldDef =
         this.fieldDefinitionResolver
-            .getFieldDefinition(FieldPath.parse(facetDefinition.path()), returnScope)
+            .getFieldDefinition(fieldPath, returnScope)
             .flatMap(FieldDefinition::numberFieldDefinition);
 
     if (returnScope.isPresent()) {
       if (numberFieldDef.isEmpty()) {
-        throwPathNotIndexedWithNumberOrDateFieldEmbedded(
-            facetDefinition, returnScope.get(), FieldTypeDefinition.Type.NUMBER);
+        throwPathNotIndexedWithNumberFieldEmbedded(path, returnScope.get());
       }
       validateIfvForEmbeddedNumericDateFacets();
       return numberFieldDef.get();
@@ -347,6 +417,10 @@ class LuceneFacetContext {
         && (numberFieldDef.isEmpty()
             || !numberFieldDef.get().hasSameOptionsAs(numberFacetFieldDef.get()))) {
       return numberFacetFieldDef.get();
+    }
+
+    if (numberFacetFieldDef.isEmpty() && numberFieldDef.isEmpty()) {
+      throwFieldNotIndexed(path, "number", Optional.empty());
     }
 
     return numberFieldDef.orElseThrow(
@@ -413,6 +487,15 @@ class LuceneFacetContext {
             returnScope,
             type.toString().toLowerCase(),
             facetDefinition.getType().toString().toLowerCase()));
+  }
+
+  private static void throwPathNotIndexedWithNumberFieldEmbedded(String path, FieldPath returnScope)
+      throws InvalidQueryException {
+    // numberFacet datatype is not supported in embeddedDocuments, so number is required there.
+    throw new InvalidQueryException(
+        String.format(
+            "Field '%s' at embeddedDocument path '%s' must be indexed as type 'number'.",
+            path, returnScope));
   }
 
   private static void throwEmbeddedNumberDateV2NotSupported() throws InvalidQueryException {

@@ -7,6 +7,7 @@ import com.google.errorprone.annotations.Var;
 import com.xgen.mongot.index.FacetBucket;
 import com.xgen.mongot.index.FacetInfo;
 import com.xgen.mongot.index.MetaResults;
+import com.xgen.mongot.index.MetricAccumulator;
 import com.xgen.mongot.index.definition.FieldTypeDefinition;
 import com.xgen.mongot.index.lucene.explain.explainers.FacetFeatureExplainer;
 import com.xgen.mongot.index.lucene.explain.timing.ExplainTimings;
@@ -478,7 +479,7 @@ class LuceneMetaResultsBuilder {
       LuceneIndexSearcher searcher,
       FacetsCollector collector,
       boolean concurrentQuery)
-      throws IOException, InterruptedException {
+      throws IOException, InterruptedException, InvalidQueryException {
 
     var result = new HashMap<String, FacetInfo>();
     Optional<ExplainTimings> facetTimings =
@@ -507,8 +508,17 @@ class LuceneMetaResultsBuilder {
               explainer.addTotalStringFacetCardinalities(
                   entry.getKey(),
                   Optional.ofNullable(facetsState.getOrdRange(entry.getValue().path()))));
+      var metricsByLabel =
+          LuceneFacetMetrics.compute(
+              entry.getValue(),
+              this.facetContext,
+              collector,
+              facetsState.getField(),
+              Optional.of(entry.getValue().path()),
+              Optional.empty());
       populateFacetBuckets(
-          counts, entry.getKey(), entry.getValue().path(), entry.getValue().numBuckets(), result);
+          counts, entry.getKey(), entry.getValue().path(), entry.getValue(), metricsByLabel,
+          result);
     }
 
     facetFeatureExplainer.ifPresent(
@@ -570,7 +580,16 @@ class LuceneMetaResultsBuilder {
                     fieldState.get(), collector);
       }
       FacetDefinition.StringFacetDefinition definition = entry.getValue();
-      populateFacetBuckets(counts, entry.getKey(), lucenePath, definition.numBuckets(), result);
+      var metricsByLabel =
+          LuceneFacetMetrics.compute(
+              definition,
+              this.facetContext,
+              collector,
+              lucenePath,
+              Optional.empty(),
+              returnScope);
+      populateFacetBuckets(
+          counts, entry.getKey(), lucenePath, definition, metricsByLabel, result);
     }
 
     facetFeatureExplainer.ifPresent(
@@ -581,9 +600,14 @@ class LuceneMetaResultsBuilder {
   }
 
   private void populateFacetBuckets(
-      Facets counts, String facetName, String path, int numBuckets, Map<String, FacetInfo> result)
+      Facets counts,
+      String facetName,
+      String path,
+      FacetDefinition.StringFacetDefinition definition,
+      Map<String, Map<String, MetricAccumulator>> metricsByLabel,
+      Map<String, FacetInfo> result)
       throws IOException {
-    FacetResult children = counts.getTopChildren(numBuckets, path);
+    FacetResult children = counts.getTopChildren(definition.numBuckets(), path);
     // can happen when the dimension was never indexed, hits does not contain facet, etc
     if (children == null) {
       result.put(facetName, new FacetInfo(List.of()));
@@ -592,7 +616,12 @@ class LuceneMetaResultsBuilder {
     var buckets =
         Stream.of(children.labelValues)
             .filter(child -> child.label != null && !child.label.isEmpty())
-            .map(child -> new FacetBucket(new BsonString(child.label), child.value.longValue()))
+            .map(
+                child ->
+                    new FacetBucket(
+                        new BsonString(child.label),
+                        child.value.longValue(),
+                        LuceneFacetMetrics.resolve(definition, metricsByLabel, child.label)))
             .collect(Collectors.toList());
     result.put(facetName, new FacetInfo(buckets));
   }

@@ -136,6 +136,7 @@ public class LuceneFacetCollectorMetaBatchProducerFactory {
     List<LuceneMetaBucketProducer> stringFacetBucketProducers =
         getStringFacetFieldBucketProducers(
             facetableStringTypeToNameToDefinition.get(FieldTypeDefinition.Type.STRING_FACET),
+            facetContext,
             searcher,
             collector,
             facetFeatureExplainer,
@@ -145,6 +146,7 @@ public class LuceneFacetCollectorMetaBatchProducerFactory {
         getTokenFieldBucketProducers(
             facetFeatureExplainer,
             facetableStringTypeToNameToDefinition.get(FieldTypeDefinition.Type.TOKEN),
+            facetContext,
             searcher,
             collector,
             returnScope,
@@ -157,11 +159,12 @@ public class LuceneFacetCollectorMetaBatchProducerFactory {
 
   private static List<LuceneMetaBucketProducer> getStringFacetFieldBucketProducers(
       Map<String, FacetDefinition.StringFacetDefinition> definitions,
+      LuceneFacetContext facetContext,
       LuceneIndexSearcher searcher,
       FacetsCollector collector,
       Optional<FacetFeatureExplainer> facetFeatureExplainer,
       Optional<NamedExecutorService> concurrentSearchExecutor)
-      throws IOException, InterruptedException {
+      throws IOException, InterruptedException, InvalidQueryException {
 
     List<LuceneMetaBucketProducer> result = new ArrayList<>();
     if (definitions.isEmpty() || searcher.getFacetsState().isEmpty()) {
@@ -194,7 +197,17 @@ public class LuceneFacetCollectorMetaBatchProducerFactory {
           Optional.ofNullable(counts.getAllChildren(entry.getValue().path()));
 
       if (facetResult.isPresent()) {
-        result.add(LuceneStringFacetMetaBucketProducer.create(facetResult.get(), entry.getKey()));
+        var metricsByLabel =
+            LuceneFacetMetrics.compute(
+                entry.getValue(),
+                facetContext,
+                collector,
+                facetsState.getField(),
+                Optional.of(entry.getValue().path()),
+                Optional.empty());
+        result.add(
+            LuceneStringFacetMetaBucketProducer.create(
+                facetResult.get(), entry.getKey(), entry.getValue(), metricsByLabel));
       }
     }
     return result;
@@ -203,6 +216,7 @@ public class LuceneFacetCollectorMetaBatchProducerFactory {
   private static List<LuceneMetaBucketProducer> getTokenFieldBucketProducers(
       Optional<FacetFeatureExplainer> facetFeatureExplainer,
       Map<String, FacetDefinition.StringFacetDefinition> facetDefinitions,
+      LuceneFacetContext facetContext,
       LuceneIndexSearcher searcher,
       FacetsCollector collector,
       Optional<FieldPath> returnScope,
@@ -253,7 +267,17 @@ public class LuceneFacetCollectorMetaBatchProducerFactory {
       Optional<FacetResult> facetResult = Optional.ofNullable(counts.getAllChildren(lucenePath));
 
       if (facetResult.isPresent()) {
-        result.add(LuceneStringFacetMetaBucketProducer.create(facetResult.get(), entry.getKey()));
+        var metricsByLabel =
+            LuceneFacetMetrics.compute(
+                entry.getValue(),
+                facetContext,
+                collector,
+                lucenePath,
+                Optional.empty(),
+                returnScope);
+        result.add(
+            LuceneStringFacetMetaBucketProducer.create(
+                facetResult.get(), entry.getKey(), entry.getValue(), metricsByLabel));
       }
     }
     return result;

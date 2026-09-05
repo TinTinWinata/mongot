@@ -20,6 +20,7 @@ java_library(
         "LuceneFacetCollectorMetaBatchProducerFactory.java",
         "LuceneFacetCollectorSearchManager.java",
         "LuceneFacetContext.java",
+        "LuceneFacetMetrics.java",
         "LuceneFacetDrillSidewaysMetaBatchProducerFactory.java",
         "LuceneFacetGenericDrillSidewaysSearchManager.java",
         "LuceneFacetOptimizedDrillSidewaysSearchManager.java",

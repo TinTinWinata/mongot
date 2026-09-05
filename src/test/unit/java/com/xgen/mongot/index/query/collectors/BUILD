@@ -6,6 +6,7 @@ java_test_suite(
         "CollectorTest.java",
         "DrillSidewaysInfoBuilderTest.java",
         "FacetCollectorTest.java",
+        "FacetMetricsParsingTest.java",
         "GenericDrillSidewaysFacetOperatorBuilderTest.java",
     ],
     data = ["//src/test/unit/resources/index/query/collectors:srcs"],

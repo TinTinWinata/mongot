@@ -10,8 +10,10 @@ import com.xgen.mongot.index.FacetBucket;
 import com.xgen.mongot.index.FacetInfo;
 import com.xgen.mongot.index.IntermediateFacetBucket;
 import com.xgen.mongot.index.MetaResults;
+import com.xgen.mongot.index.MetricAccumulator;
 import com.xgen.mongot.index.lucene.explain.tracing.Explain;
 import com.xgen.mongot.index.query.collectors.FacetDefinition;
+import com.xgen.mongot.index.query.collectors.MetricDefinition;
 import com.xgen.mongot.index.query.counts.Count;
 import com.xgen.mongot.util.Bytes;
 import com.xgen.mongot.util.Check;
@@ -65,10 +67,10 @@ public class FacetMergingBatchProducer implements BatchProducer {
 
   // Sorts the string facet first by count in descending order, then by string key in ascending
   // order.
-  static class StringFacetCountComparator implements Comparator<Map.Entry<BsonValue, Long>> {
+  static class StringFacetCountComparator implements Comparator<Map.Entry<BsonValue, BucketState>> {
     @Override
-    public int compare(Map.Entry<BsonValue, Long> a, Map.Entry<BsonValue, Long> b) {
-      int valueCompare = Long.compare(b.getValue(), a.getValue());
+    public int compare(Map.Entry<BsonValue, BucketState> a, Map.Entry<BsonValue, BucketState> b) {
+      int valueCompare = Long.compare(b.getValue().count(), a.getValue().count());
       if (valueCompare != 0) {
         return valueCompare;
       }
@@ -77,18 +79,41 @@ public class FacetMergingBatchProducer implements BatchProducer {
   }
 
   // Sorts the string facet by string key in ascending order.
-  static class StringFacetKeyComparator implements Comparator<Map.Entry<BsonValue, Long>> {
+  static class StringFacetKeyComparator implements Comparator<Map.Entry<BsonValue, BucketState>> {
     @Override
-    public int compare(Map.Entry<BsonValue, Long> a, Map.Entry<BsonValue, Long> b) {
+    public int compare(Map.Entry<BsonValue, BucketState> a, Map.Entry<BsonValue, BucketState> b) {
       return a.getKey().asString().getValue().compareTo(b.getKey().asString().getValue());
     }
   }
 
+  /**
+   * The state merged for one bucket across index partitions: the document count plus, for facets
+   * that requested metrics, the mergeable accumulator behind each metric.
+   */
+  record BucketState(long count, Optional<Map<String, MetricAccumulator>> metrics) {
+
+    BucketState merge(BucketState other) {
+      if (this.metrics.isEmpty() && other.metrics.isEmpty()) {
+        return new BucketState(this.count + other.count, Optional.empty());
+      }
+
+      Map<String, MetricAccumulator> merged =
+          new HashMap<>(this.metrics.orElseGet(Map::of));
+      other
+          .metrics
+          .orElseGet(Map::of)
+          .forEach((name, accumulator) -> merged.merge(name, accumulator,
+              MetricAccumulator::merge));
+      return new BucketState(this.count + other.count, Optional.of(merged));
+    }
+  }
+
   private static class MergedResult {
-    public final Table<String, BsonValue, Long> table; // tuples of (facetName, bucket, count)
+    // tuples of (facetName, bucket, merged bucket state)
+    public final Table<String, BsonValue, BucketState> table;
     public final long totalHits;
 
-    public MergedResult(Table<String, BsonValue, Long> table, long totalHits) {
+    public MergedResult(Table<String, BsonValue, BucketState> table, long totalHits) {
       this.table = table;
       this.totalHits = totalHits;
     }
@@ -104,21 +129,22 @@ public class FacetMergingBatchProducer implements BatchProducer {
     // 2. Limit number of buckets (e.g. 10000) for string facet.
     //  The HashBasedTable uses LinkedHashMap, so it guarantees the read iterator order == the
     // inserted order.
-    Table<String, BsonValue, Long> facetTable = HashBasedTable.create();
+    Table<String, BsonValue, BucketState> facetTable = HashBasedTable.create();
     @Var long mergedTotalHits = 0;
     for (int i = 0; i < batchProducers.size(); i++) {
       try (var indexPartitionResourceManager = Explain.maybeEnterIndexPartitionQueryContext(i)) {
         mergedTotalHits += batchProducers.get(i).getTotalHits();
         List<IntermediateFacetBucket> buckets = batchProducers.get(i).getAllBucketResults();
         for (var bucket : buckets) {
+          BucketState state = new BucketState(bucket.count(), bucket.metrics());
           // Tag is the facet name.
           if (facetTable.contains(bucket.tag(), bucket.bucket())) {
             facetTable.put(
                 bucket.tag(),
                 bucket.bucket(),
-                facetTable.get(bucket.tag(), bucket.bucket()) + bucket.count());
+                facetTable.get(bucket.tag(), bucket.bucket()).merge(state));
           } else {
-            facetTable.put(bucket.tag(), bucket.bucket(), bucket.count());
+            facetTable.put(bucket.tag(), bucket.bucket(), state);
           }
         }
       }
@@ -127,7 +153,7 @@ public class FacetMergingBatchProducer implements BatchProducer {
   }
 
   private static ArrayDeque<IntermediateFacetBucket> convertToIntermediateBuckets(
-      Table<String, BsonValue, Long> facetTable,
+      Table<String, BsonValue, BucketState> facetTable,
       Map<String, FacetDefinition> facetNameToDefinition) {
     // Convert the table to a list of the encodable IntermediateFacetBucket.
     ArrayDeque<IntermediateFacetBucket> mergedFacetBuckets = new ArrayDeque<>();
@@ -158,7 +184,8 @@ public class FacetMergingBatchProducer implements BatchProducer {
                     IntermediateFacetBucket.Type.FACET,
                     facetName,
                     entry.getKey(),
-                    entry.getValue()));
+                    entry.getValue().count(),
+                    entry.getValue().metrics()));
           });
     }
     return mergedFacetBuckets;
@@ -231,9 +258,18 @@ public class FacetMergingBatchProducer implements BatchProducer {
                 .sorted(new StringFacetCountComparator())
                 .limit(stringFacetDefinition.numBuckets());
       }
+      Map<String, MetricDefinition> metrics =
+          facetDefinition instanceof FacetDefinition.StringFacetDefinition stringFacetDef
+              ? stringFacetDef.metrics()
+              : Map.of();
       List<FacetBucket> buckets =
           entryStream
-              .map(entry -> new FacetBucket(entry.getKey(), entry.getValue()))
+              .map(
+                  entry ->
+                      new FacetBucket(
+                          entry.getKey(),
+                          entry.getValue().count(),
+                          resolveMetrics(metrics, entry.getValue())))
               .collect(Collectors.toList());
       FacetInfo facetInfo = new FacetInfo(buckets);
       facetNameToInfo.put(facetName, facetInfo);
@@ -241,6 +277,15 @@ public class FacetMergingBatchProducer implements BatchProducer {
     // Explicitly calling close() from this class, which throws no exception.
     this.close();
     return new MetaResults(countResult, Optional.of(facetNameToInfo));
+  }
+
+  private static Optional<Map<String, BsonValue>> resolveMetrics(
+      Map<String, MetricDefinition> metrics, BucketState state) {
+    if (metrics.isEmpty()) {
+      return Optional.empty();
+    }
+    return Optional.of(
+        LuceneFacetMetrics.resolve(metrics, state.metrics().orElseGet(Map::of)));
   }
 
   @Override

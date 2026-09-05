@@ -5,6 +5,9 @@ import com.xgen.mongot.util.bson.parser.BsonParseException;
 import com.xgen.mongot.util.bson.parser.DocumentEncodable;
 import com.xgen.mongot.util.bson.parser.DocumentParser;
 import com.xgen.mongot.util.bson.parser.Field;
+import com.xgen.mongot.util.bson.parser.Value;
+import java.util.Map;
+import java.util.Optional;
 import org.bson.BsonDocument;
 import org.bson.BsonValue;
 
@@ -18,9 +21,22 @@ import org.bson.BsonValue;
  *
  * @param tag The name of the facet.
  * @param bucket The facet boundary, or the string facet value.
+ * @param metrics Mergeable accumulator state for each metric requested on this facet, keyed by
+ *     metric name. Carries {@code count} and {@code sum} rather than a resolved average so that it
+ *     stays associative across index partitions and shards.
  */
-public record IntermediateFacetBucket(Type type, String tag, BsonValue bucket, long count)
+public record IntermediateFacetBucket(
+    Type type,
+    String tag,
+    BsonValue bucket,
+    long count,
+    Optional<Map<String, MetricAccumulator>> metrics)
     implements DocumentEncodable {
+
+  /** Creates a bucket carrying a count only. */
+  public IntermediateFacetBucket(Type type, String tag, BsonValue bucket, long count) {
+    this(type, tag, bucket, count, Optional.empty());
+  }
 
   private static class Fields {
     static final Field.Required<Type> TYPE =
@@ -32,6 +48,16 @@ public record IntermediateFacetBucket(Type type, String tag, BsonValue bucket, l
         Field.builder("bucket").unparsedValueField().required();
 
     static final Field.Required<Long> COUNT = Field.builder("count").longField().required();
+
+    static final Field.Optional<Map<String, MetricAccumulator>> METRICS =
+        Field.builder("metrics")
+            .mapOf(
+                Value.builder()
+                    .classValue(MetricAccumulator::fromBson)
+                    .disallowUnknownFields()
+                    .required())
+            .optional()
+            .noDefault();
   }
 
   public enum Type {
@@ -43,7 +69,8 @@ public record IntermediateFacetBucket(Type type, String tag, BsonValue bucket, l
         parser.getField(Fields.TYPE).unwrap(),
         parser.getField(Fields.TAG).unwrap(),
         parser.getField(Fields.BUCKET).unwrap(),
-        parser.getField(Fields.COUNT).unwrap());
+        parser.getField(Fields.COUNT).unwrap(),
+        parser.getField(Fields.METRICS).unwrap());
   }
 
   @Override
@@ -53,6 +80,7 @@ public record IntermediateFacetBucket(Type type, String tag, BsonValue bucket, l
         .field(Fields.TAG, this.tag)
         .field(Fields.BUCKET, this.bucket)
         .field(Fields.COUNT, this.count)
+        .field(Fields.METRICS, this.metrics)
         .build();
   }
 }

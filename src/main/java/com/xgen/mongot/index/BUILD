@@ -41,6 +41,7 @@ java_library(
         "InitializedVectorIndex.java",
         "IntermediateFacetBucket.java",
         "MetaResults.java",
+        "MetricAccumulator.java",
         "MeteredBatchProducer.java",
         "MeteredIndexWriter.java",
         "MeteredSearchIndexReader.java",

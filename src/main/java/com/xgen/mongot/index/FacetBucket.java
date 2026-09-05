@@ -5,7 +5,10 @@ import com.xgen.mongot.util.bson.parser.BsonParseException;
 import com.xgen.mongot.util.bson.parser.DocumentEncodable;
 import com.xgen.mongot.util.bson.parser.DocumentParser;
 import com.xgen.mongot.util.bson.parser.Field;
+import com.xgen.mongot.util.bson.parser.Value;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import org.bson.BsonDocument;
 import org.bson.BsonValue;
 
@@ -15,19 +18,33 @@ public class FacetBucket implements DocumentEncodable {
         Field.builder("_id").unparsedValueField().required();
 
     static final Field.Required<Long> COUNT = Field.builder("count").longField().required();
+
+    static final Field.Optional<Map<String, BsonValue>> METRICS =
+        Field.builder("metrics")
+            .mapOf(Value.builder().unparsedValueField().required())
+            .optional()
+            .noDefault();
   }
 
   private final BsonValue id;
   private final long count;
+  private final Optional<Map<String, BsonValue>> metrics;
 
   public FacetBucket(BsonValue id, long count) {
+    this(id, count, Optional.empty());
+  }
+
+  public FacetBucket(BsonValue id, long count, Optional<Map<String, BsonValue>> metrics) {
     this.id = id;
     this.count = count;
+    this.metrics = metrics;
   }
 
   static FacetBucket fromBson(DocumentParser parser) throws BsonParseException {
     return new FacetBucket(
-        parser.getField(Fields.ID).unwrap(), parser.getField(Fields.COUNT).unwrap());
+        parser.getField(Fields.ID).unwrap(),
+        parser.getField(Fields.COUNT).unwrap(),
+        parser.getField(Fields.METRICS).unwrap());
   }
 
   @Override
@@ -35,7 +52,13 @@ public class FacetBucket implements DocumentEncodable {
     return BsonDocumentBuilder.builder()
         .field(Fields.ID, this.id)
         .field(Fields.COUNT, this.count)
+        .field(Fields.METRICS, this.metrics)
         .build();
+  }
+
+  /** Resolved metric values keyed by the name the query requested them under. */
+  public Optional<Map<String, BsonValue>> getMetrics() {
+    return this.metrics;
   }
 
   public long getCount() {
@@ -48,7 +71,7 @@ public class FacetBucket implements DocumentEncodable {
 
   @Override
   public int hashCode() {
-    return Objects.hash(this.id, this.count);
+    return Objects.hash(this.id, this.count, this.metrics);
   }
 
   @Override
@@ -60,11 +83,19 @@ public class FacetBucket implements DocumentEncodable {
       return false;
     }
     FacetBucket other = (FacetBucket) obj;
-    return Objects.equals(this.id, other.id) && this.getCount() == other.getCount();
+    return Objects.equals(this.id, other.id)
+        && this.getCount() == other.getCount()
+        && Objects.equals(this.metrics, other.metrics);
   }
 
   @Override
   public String toString() {
-    return "FacetBucket(id=" + this.id + ", count=" + this.count + ")";
+    return "FacetBucket(id="
+        + this.id
+        + ", count="
+        + this.count
+        + ", metrics="
+        + this.metrics
+        + ")";
   }
 }
