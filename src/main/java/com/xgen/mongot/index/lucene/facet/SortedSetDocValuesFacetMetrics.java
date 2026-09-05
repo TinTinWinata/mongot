@@ -13,7 +13,7 @@ import org.apache.lucene.facet.FacetsCollector.MatchingDocs;
 import org.apache.lucene.facet.FacetsConfig;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.LeafReader;
-import org.apache.lucene.index.NumericDocValues;
+import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.search.ConjunctionUtils;
@@ -23,7 +23,7 @@ import org.apache.lucene.util.BytesRef;
 /**
  * Accumulates a {@link MetricAccumulator} per string facet bucket over the documents matched by a
  * {@link FacetsCollector}, reading the bucket from a {@link SortedSetDocValues} field and the
- * metric value from a {@link NumericDocValues} field.
+ * metric value from a numeric doc values field.
  *
  * <p>This is the metric analogue of {@link SortedSetDocValuesFacetCounts}: it walks the same
  * matching documents over the same columnar doc values, so no stored fields are decompressed and no
@@ -32,9 +32,10 @@ import org.apache.lucene.util.BytesRef;
  * org.apache.lucene.index.OrdinalMap} at the cost of one hash lookup per distinct bucket per
  * segment.
  *
- * <p>Documents that do not have a single numeric value at the metric path contribute nothing. In
- * particular a document holding an array at that path is indexed without numeric doc values (see
- * {@code IndexableFieldFactory#addNumericMultipleField}) and is therefore skipped.
+ * <p>Documents that do not have exactly one numeric value at the metric path contribute nothing,
+ * which matches how MQL's {@code $avg} ignores a field holding an array. Numeric fields reach the
+ * index either as {@code NUMERIC} doc values (facet fields) or as {@code SORTED_NUMERIC} (the
+ * sortable "v2" fields, written through lucene's {@code LongField}), so both are read here.
  */
 public final class SortedSetDocValuesFacetMetrics {
 
@@ -84,7 +85,9 @@ public final class SortedSetDocValuesFacetMetrics {
       return;
     }
 
-    NumericDocValues metricValues = DocValues.getNumeric(reader, valueField);
+    // Numeric fields are written either as NUMERIC (facet fields) or SORTED_NUMERIC (the sortable
+    // v2 fields, via lucene's LongField). getSortedNumeric transparently adapts the former.
+    SortedNumericDocValues metricValues = DocValues.getSortedNumeric(reader, valueField);
 
     int segmentCardinality = (int) groupValues.getValueCount();
     long[] counts = new long[segmentCardinality];
@@ -104,11 +107,11 @@ public final class SortedSetDocValuesFacetMetrics {
 
     @Var boolean anyValues = false;
     for (@Var int doc = it.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = it.nextDoc()) {
-      if (!metricValues.advanceExact(doc)) {
-        // The document has no single numeric value at the metric path.
+      if (!metricValues.advanceExact(doc) || metricValues.docValueCount() != 1) {
+        // The document has no value, or holds an array, at the metric path.
         continue;
       }
-      double value = valueDecoder.applyAsDouble(metricValues.longValue());
+      double value = valueDecoder.applyAsDouble(metricValues.nextValue());
       anyValues = true;
 
       if (singleGroupValue != null) {

@@ -14,6 +14,7 @@ import com.xgen.mongot.index.definition.SearchIndexCapabilities;
 import com.xgen.mongot.index.definition.SearchIndexDefinition;
 import com.xgen.mongot.index.lucene.codec.LuceneCodec;
 import com.xgen.mongot.index.lucene.field.FieldName;
+import com.xgen.mongot.index.lucene.util.LuceneDoubleConversionUtils;
 import com.xgen.mongot.index.lucene.searcher.LuceneSearcherFactory;
 import com.xgen.mongot.index.lucene.searcher.LuceneSearcherManager;
 import com.xgen.mongot.index.lucene.searcher.QueryCacheProvider;
@@ -43,7 +44,7 @@ import java.util.OptionalDouble;
 import java.util.stream.Collectors;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
-import org.apache.lucene.document.NumericDocValuesField;
+import org.apache.lucene.document.LongField;
 import org.apache.lucene.document.StringField;
 import org.apache.lucene.facet.FacetsCollectorManager;
 import org.apache.lucene.facet.FacetsConfig;
@@ -65,8 +66,12 @@ public class LuceneFacetMetricsTest {
   private static final String PRICE_FIELD = "price";
   private static final String GROUP_FIELD = "group";
 
-  private static final String PRICE_LUCENE_FIELD =
+  private static final String PRICE_INT64_LUCENE_FIELD =
       FieldName.TypeField.NUMBER_INT64_V2.getLuceneFieldName(
+          FieldPath.parse(PRICE_FIELD), Optional.empty());
+
+  private static final String PRICE_DOUBLE_LUCENE_FIELD =
+      FieldName.TypeField.NUMBER_DOUBLE_V2.getLuceneFieldName(
           FieldPath.parse(PRICE_FIELD), Optional.empty());
 
   @Test
@@ -183,6 +188,30 @@ public class LuceneFacetMetricsTest {
   }
 
   @Test
+  public void buildFacetMetaResults_doubleRepresentation_decodesSortableLongs() throws Exception {
+    FacetDefinition.StringFacetDefinition facet =
+        new FacetDefinition.StringFacetDefinition(
+            CATEGORY_FIELD,
+            10,
+            Map.of("avgPrice", new MetricDefinition(MetricDefinition.Type.AVG, PRICE_FIELD)));
+
+    // Doubles are stored as order-preserving longs, so the metric has to decode them rather than
+    // read the raw doc value.
+    MetaResults results =
+        runFacetQuery(
+            facet,
+            List.of(
+                doubleReprDoc("books", 2.5, "hit"),
+                doubleReprDoc("books", -7.5, "hit"),
+                doubleReprDoc("books", 10.0, "hit")),
+            NumericFieldOptions.Representation.DOUBLE);
+
+    FacetBucket bucket = results.facet().orElseThrow().get("categoryFacet").buckets().get(0);
+    assertEquals(3L, bucket.getCount());
+    assertEquals(OptionalDouble.of(5.0 / 3.0), metric(bucket, "avgPrice"));
+  }
+
+  @Test
   public void merge_isAssociativeAcrossPartitions() {
     // Averaging averages is only correct for equally sized groups, so the accumulator has to carry
     // the sum and count instead. Two partitions of unequal size prove the difference.
@@ -221,7 +250,15 @@ public class LuceneFacetMetricsTest {
   private static MetaResults runFacetQuery(
       FacetDefinition.StringFacetDefinition facet, List<Document> documents)
       throws IOException, InterruptedException, InvalidQueryException {
-    LuceneFacetContext facetContext = createFacetContext();
+    return runFacetQuery(facet, documents, NumericFieldOptions.Representation.INT64);
+  }
+
+  private static MetaResults runFacetQuery(
+      FacetDefinition.StringFacetDefinition facet,
+      List<Document> documents,
+      NumericFieldOptions.Representation representation)
+      throws IOException, InterruptedException, InvalidQueryException {
+    LuceneFacetContext facetContext = createFacetContext(representation);
 
     FacetCollector collector =
         new FacetCollectorBuilder()
@@ -278,9 +315,25 @@ public class LuceneFacetMetricsTest {
     }
   }
 
+  /**
+   * Indexes the metric value the way {@code IndexableFieldFactory} does for a sortable numeric
+   * field: through lucene's {@link LongField}, which yields {@code SORTED_NUMERIC} doc values
+   * rather than {@code NUMERIC}.
+   */
   private static Document doc(String category, long price, String group) {
     Document document = docWithoutPrice(category, group);
-    document.add(new NumericDocValuesField(PRICE_LUCENE_FIELD, price));
+    document.add(new LongField(PRICE_INT64_LUCENE_FIELD, price, Field.Store.NO));
+    return document;
+  }
+
+  /** The same, for a field indexed with the {@code DOUBLE} representation. */
+  private static Document doubleReprDoc(String category, double price, String group) {
+    Document document = docWithoutPrice(category, group);
+    document.add(
+        new LongField(
+            PRICE_DOUBLE_LUCENE_FIELD,
+            LuceneDoubleConversionUtils.toMqlSortableLong(price),
+            Field.Store.NO));
     return document;
   }
 
@@ -291,7 +344,8 @@ public class LuceneFacetMetricsTest {
     return document;
   }
 
-  private static LuceneFacetContext createFacetContext() {
+  private static LuceneFacetContext createFacetContext(
+      NumericFieldOptions.Representation representation) {
     SearchIndexDefinition indexDefinition =
         SearchIndexDefinitionBuilder.builder()
             .defaultMetadata()
@@ -308,7 +362,7 @@ public class LuceneFacetMetricsTest {
                         FieldDefinitionBuilder.builder()
                             .number(
                                 NumericFieldDefinitionBuilder.builder()
-                                    .representation(NumericFieldOptions.Representation.INT64)
+                                    .representation(representation)
                                     .buildNumberField())
                             .build())
                     .build())
