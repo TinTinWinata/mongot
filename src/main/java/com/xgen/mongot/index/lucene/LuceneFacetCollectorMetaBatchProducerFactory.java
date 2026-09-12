@@ -13,6 +13,7 @@ import com.xgen.mongot.index.query.InvalidQueryException;
 import com.xgen.mongot.index.query.ReturnScope;
 import com.xgen.mongot.index.query.collectors.FacetCollector;
 import com.xgen.mongot.index.query.collectors.FacetDefinition;
+import com.xgen.mongot.index.query.collectors.MetricsCollector;
 import com.xgen.mongot.util.FieldPath;
 import com.xgen.mongot.util.concurrent.NamedExecutorService;
 import com.xgen.mongot.util.timers.InvocationCountingTimer;
@@ -47,6 +48,8 @@ public class LuceneFacetCollectorMetaBatchProducerFactory {
         "LuceneFacetCollectorMetaBatchProducer requires an exact count.");
     var returnScopePath = collectorQuery.returnScope().map(ReturnScope::path);
     switch (collectorQuery.collector()) {
+      case MetricsCollector ignored:
+        throw new IllegalStateException("metrics collector queries do not produce facet buckets");
       case FacetCollector facetCollector:
         Map<FacetDefinition.Type, Map<String, FacetDefinition>> typeToFacetToDefinition =
             facetCollector.getFacetDefinitionsByType();

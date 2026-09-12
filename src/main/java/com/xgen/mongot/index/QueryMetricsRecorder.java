@@ -15,6 +15,7 @@ import com.xgen.mongot.index.query.collectors.Collector;
 import com.xgen.mongot.index.query.collectors.DrillSidewaysInfoBuilder.DrillSidewaysInfo;
 import com.xgen.mongot.index.query.collectors.DrillSidewaysInfoBuilder.DrillSidewaysInfo.QueryOptimizationStatus;
 import com.xgen.mongot.index.query.collectors.FacetCollector;
+import com.xgen.mongot.index.query.collectors.MetricsCollector;
 import com.xgen.mongot.index.query.operators.AllDocumentsOperator;
 import com.xgen.mongot.index.query.operators.AutocompleteOperator;
 import com.xgen.mongot.index.query.operators.CompoundOperator;
@@ -195,6 +196,8 @@ public class QueryMetricsRecorder {
         Stream.of(this.queryFeaturesMetricsUpdater.getCollectorTypeCounter(collector.getType()));
 
     return switch (collector) {
+      case MetricsCollector metricsCollector ->
+          Stream.concat(getOperatorCounters(metricsCollector.operator()), collectorTypeCounter);
       case FacetCollector facetCollector ->
           Stream.concat(
               Stream.concat(
