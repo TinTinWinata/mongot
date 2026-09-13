@@ -16,6 +16,7 @@ import org.bson.BsonArray;
 import org.bson.BsonDateTime;
 import org.bson.BsonDocument;
 import org.bson.BsonInt32;
+import org.bson.BsonNull;
 import org.bson.BsonString;
 import org.junit.Assert;
 import org.junit.Test;
@@ -338,6 +339,90 @@ public class ShardedSearchPlannerTest {
         ShardedSearchPlanBuilder.collector()
             .facetDocs(facetDocs)
             .bucketDoc(bucketDoc)
+            .countType("lowerBound")
+            .build();
+
+    Assert.assertEquals(expected, result);
+  }
+
+  private static BsonDocument createMetricFacetDoc(String metricName, String component) {
+    return new BsonDocument(
+        metricName + "_" + component,
+        new BsonArray(
+            List.of(
+                new BsonDocument(
+                    "$match",
+                    new BsonDocument()
+                        .append("_id.type", new BsonDocument("$eq", new BsonString("metric")))
+                        .append("_id.tag", new BsonDocument("$eq", new BsonString(metricName)))
+                        .append(
+                            "_id.bucket", new BsonDocument("$eq", new BsonString(component)))))));
+  }
+
+  private static BsonDocument first(String metricName, String component, String accumulator) {
+    return new BsonDocument(
+        "$first", new BsonString("$" + metricName + "_" + component + "." + accumulator));
+  }
+
+  @Test
+  public void testMetrics() throws Exception {
+    var query =
+        new BsonDocument(
+            "metrics",
+            new BsonDocument()
+                .append("operator", getOperatorQuery())
+                .append(
+                    "metrics",
+                    new BsonDocument()
+                        .append(
+                            "maxPrice",
+                            new BsonDocument()
+                                .append("type", new BsonString("max"))
+                                .append("path", new BsonString("price")))
+                        .append(
+                            "avgRating",
+                            new BsonDocument()
+                                .append("type", new BsonString("avg"))
+                                .append("path", new BsonString("rating")))));
+    PlanShardedSearchCommandResponseDefinition.ShardedSearchPlan result =
+        ShardedSearchPlanner.planSearch(
+            SearchQuery.fromBson(query), new PlanShardedSearchCommandDefinition.SearchFeatures(0));
+
+    // Metrics are emitted in name order: avgRating (sum, count) then maxPrice (max).
+    var facetDocs =
+        List.of(
+            createMetricFacetDoc("avgRating", "sum"),
+            createMetricFacetDoc("avgRating", "count"),
+            createMetricFacetDoc("maxPrice", "max"));
+    var metricsDoc =
+        new BsonDocument()
+            .append(
+                "avgRating",
+                new BsonDocument(
+                    "$cond",
+                    new BsonDocument()
+                        .append(
+                            "if",
+                            new BsonDocument(
+                                "$gt",
+                                new BsonArray(
+                                    List.of(
+                                        first("avgRating", "count", "value"),
+                                        new BsonInt32(0)))))
+                        .append(
+                            "then",
+                            new BsonDocument(
+                                "$divide",
+                                new BsonArray(
+                                    List.of(
+                                        first("avgRating", "sum", "metricSum"),
+                                        first("avgRating", "count", "value")))))
+                        .append("else", BsonNull.VALUE)))
+            .append("maxPrice", first("maxPrice", "max", "metricMax"));
+    PlanShardedSearchCommandResponseDefinition.ShardedSearchPlan expected =
+        ShardedSearchPlanBuilder.metrics()
+            .facetDocs(facetDocs)
+            .metricsDoc(metricsDoc)
             .countType("lowerBound")
             .build();
 
